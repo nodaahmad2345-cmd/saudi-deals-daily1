@@ -1,0 +1,143 @@
+name: 🛍️ Saudi Deals — Auto Scraper
+
+on:
+  schedule:
+    #  كل 6 ساعات: 00:00 / 06:00 / 12:00 / 18:00 UTC
+    - cron: '0 0,6,12,18 * * *'
+  workflow_dispatch:        # تشغيل يدوي من لوحة GitHub
+    inputs:
+      force_playwright:
+        description: 'Force Playwright for all sites (true/false)'
+        required: false
+        default: 'false'
+  push:
+    branches: [ main ]
+    paths:
+      - 'scraper.py'        # أعد التشغيل عند تعديل السكريبت فقط
+
+permissions:
+  contents: write           # ضروري لـ git push
+  actions: read
+
+concurrency:
+  group: scraper            # امنع تشغيلين في وقت واحد
+  cancel-in-progress: true
+
+jobs:
+  scrape:
+    name: 🤖 Scrape & Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+
+      # ── 1. سحب الكود ────────────────────────────────────────────────────────
+      - name: ⬇️ Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      # ── 2. إعداد Python ─────────────────────────────────────────────────────
+      - name: 🐍 Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # ── 3. تثبيت المكتبات ───────────────────────────────────────────────────
+      - name: 📦 Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests beautifulsoup4 playwright lxml
+
+      # ── 4. تثبيت Chromium headless ─────────────────────────────────────────
+      #    --with-deps يثبّت كل مكتبات النظام اللازمة تلقائياً
+      - name: 🌐 Install Playwright Chromium (headless)
+        run: playwright install chromium --with-deps
+
+      # ── 5. التحقق من وضع headless ─────────────────────────────────────────
+      - name: ✅ Verify headless mode is enabled
+        run: |
+          python3 -c "
+          import re, pathlib
+          code = pathlib.Path('scraper.py').read_text()
+          match = re.search(r'launch\(.*?headless\s*=\s*(True|False)', code, re.DOTALL)
+          if match and match.group(1) == 'True':
+              print('✅  headless=True — OK')
+          else:
+              print('⚠️  headless=True not confirmed — patching...')
+              patched = re.sub(r'(launch\([^)]*?)headless\s*=\s*False', r'\1headless=True', code)
+              pathlib.Path('scraper.py').write_text(patched)
+              print('✅  Patched successfully')
+          "
+
+      # ── 6. تشغيل السكريبت ───────────────────────────────────────────────────
+      - name: 🚀 Run scraper.py
+        run: python scraper.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          # أضف متغيرات البيئة الإضافية هنا (مثل Telegram token):
+          # TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          # TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      # ── 7. التحقق من صحة sites.json ────────────────────────────────────────
+      - name: 🔍 Validate sites.json
+        run: |
+          python3 -c "
+          import json, sys, pathlib
+          p = pathlib.Path('sites.json')
+          if not p.exists():
+              print('❌ sites.json missing!')
+              sys.exit(1)
+          d = json.loads(p.read_text())
+          assert 'sites' in d, 'Missing sites key'
+          assert len(d['sites']) > 0, 'Empty sites list'
+          print(f'✅ Valid — {len(d[\"sites\"])} stores, generated_at={d.get(\"generated_at\")}')
+          "
+
+      # ── 8. رفع sites.json المحدَّث ──────────────────────────────────────────
+      - name: 💾 Commit & push updated sites.json
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sites.json
+          # لا ترفع إذا لم يتغير الملف — يوفّر حدود الـ Actions
+          if git diff --cached --quiet; then
+            echo "✅ No changes in sites.json — skipping commit"
+          else
+            TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+            git commit -m "🤖 auto: update deals [$TIMESTAMP]"
+            git push
+            echo "✅ Pushed new sites.json"
+          fi
+
+      # ── 9. ملخص الجلسة (يظهر في تبويب Summary بـ GitHub) ─────────────────
+      - name: 📊 Job Summary
+        if: always()
+        run: |
+          {
+            echo "## 🛍️ Saudi Deals — Scrape Report"
+            echo ""
+            echo "| المعلومة | القيمة |"
+            echo "|---|---|"
+            if [ -f sites.json ]; then
+              python3 - <<'EOF'
+          import json, datetime
+          d = json.load(open('sites.json'))
+          sites = d.get('sites', [])
+          total  = len(sites)
+          active = sum(1 for s in sites if s.get('active', True))
+          top    = max(sites, key=lambda s: s.get('discount', 0), default={})
+          gen    = d.get('generated_at', 'N/A')
+          print(f"| إجمالي المتاجر | **{total}** |")
+          print(f"| المتاجر النشطة | **{active}** |")
+          print(f"| أعلى خصم | **{top.get('name','-')} — {top.get('discount',0)}%** |")
+          print(f"| وقت التوليد | {gen} |")
+          EOF
+            else
+              echo "| الحالة | ❌ sites.json غير موجود |"
+            fi
+            echo ""
+            echo "> آخر تشغيل: $(date -u '+%A %d %B %Y — %H:%M UTC')"
+          } >> $GITHUB_STEP_SUMMARY
